@@ -1,0 +1,250 @@
+Imports System
+Imports System.Collections.Generic
+Imports System.Globalization
+Imports System.Linq
+Imports System.Text
+Imports OneStream.Shared.Common
+Imports OneStream.Shared.Database
+Imports OneStream.Shared.Engine
+Imports OneStream.Shared.Wcf
+Imports OneStream.Finance.Engine
+
+Namespace OneStream.BusinessRule.Extender.EDJ_MM_EntityRollover_2026
+    Public Class MainClass
+
+        'ONLY SWITCH: False = preview; True = execute the archive and clone.
+        Private Const RunMode As Boolean = False
+
+        Private Const DimensionName As String = "MarketManagement"
+        Private Const SourceRoot As String = "Top_MM"
+        Private Const ArchiveSuffix As String = "_2026"
+        Private Const StagePrefix As String = "MMSTG2026_"
+
+        'HomeOffice is always excluded from the new hierarchy; its existing relationship is preserved.
+        Private Shared ReadOnly ExecutionLock As New Object()
+
+        Private Class Edge
+            Public ParentId As Integer
+            Public ChildId As Integer
+            Public ParentName As String
+            Public ChildName As String
+        End Class
+
+        Public Function Main(ByVal si As SessionInfo, ByVal globals As BRGlobals, ByVal api As Object, ByVal args As ExtenderArgs) As Object
+            Try
+                If args.FunctionType <> ExtenderFunctionType.Unknown AndAlso args.FunctionType <> ExtenderFunctionType.ExecuteDataMgmtBusinessRuleStep Then Return Nothing
+
+                SyncLock ExecutionLock
+                    Return Process(si)
+                End SyncLock
+
+            Catch ex As Exception
+                Throw ErrorHandler.LogWrite(si, New XFException(si, ex))
+            End Try
+        End Function
+
+        Private Function Process(si As SessionInfo) As Object
+
+            Dim dp As DimPk = BRApi.Finance.Dim.GetDimPk(si, DimensionName)
+            Dim rootId As Integer = BRApi.Finance.Members.GetMemberId(si, DimType.Entity.Id, SourceRoot)
+
+            If rootId <= 0 Then Throw New Exception("Source root not found: " & SourceRoot)
+
+            Dim nodes As New Dictionary(Of Integer, Member)()
+            Dim parents As New Dictionary(Of Integer, WritableMember)()
+            Dim edges As New List(Of Edge)()
+            Dim visiting As New HashSet(Of Integer)()
+            Dim visited As New HashSet(Of Integer)()
+            Dim blockers As New List(Of String)()
+
+            Walk(si, dp, rootId, nodes, parents, edges, visiting, visited)
+
+            If Not parents.ContainsKey(rootId) Then Throw New Exception("Source root has no eligible children.")
+            If parents.Count > 1000 OrElse nodes.Count > 100000 Then Throw New Exception("Unexpected hierarchy size; review scope.")
+
+            Dim incoming As List(Of Member) = BRApi.Finance.Members.GetParents(si, dp, rootId, True, Nothing)
+
+            If incoming Is Nothing OrElse incoming.Count <> 1 Then
+                blockers.Add("Expected one dimension-root relationship for " & SourceRoot & ".")
+            ElseIf Not String.Equals(incoming(0).Name, "Root", StringComparison.OrdinalIgnoreCase) Then
+                blockers.Add("Source root has an external parent: " & incoming(0).Name)
+            Else
+                edges.Insert(0, New Edge With {.ParentId = incoming(0).MemberId, .ChildId = rootId, .ParentName = incoming(0).Name, .ChildName = SourceRoot})
+            End If
+
+            For Each m As WritableMember In parents.Values
+                If m.DimId <> dp.DimId Then blockers.Add("Parent belongs to another dimension: " & m.Name)
+                If m.Name.EndsWith(ArchiveSuffix, StringComparison.OrdinalIgnoreCase) Then blockers.Add("Source already has archive suffix: " & m.Name)
+                If Not String.IsNullOrWhiteSpace(m.Alias) Then blockers.Add("Alias needs an explicit uniqueness policy: " & m.Name & " = " & m.Alias)
+
+                For Each proposed As String In New String() {m.Name & ArchiveSuffix, StagePrefix & m.MemberId.ToString(CultureInfo.InvariantCulture)}
+                    If proposed.Length > 100 Then blockers.Add("Review member name length: " & proposed)
+                    If BRApi.Finance.Members.GetMemberId(si, DimType.Entity.Id, proposed) > 0 Then blockers.Add("Existing target or incomplete prior attempt: " & proposed)
+                Next
+
+                If m.MemberId <> rootId Then
+                    For Each p As Member In BRApi.Finance.Members.GetParents(si, dp, m.MemberId, True, Nothing)
+                        If Not parents.ContainsKey(p.MemberId) Then blockers.Add("Parent is shared outside the source tree: " & m.Name & " under " & p.Name)
+                    Next
+                End If
+
+                'Read every stored variation and language description before allowing writes.
+                If BRApi.Finance.Members.ReadMemberPropertiesNoCache(si, DimType.Entity.Id, m.MemberId) Is Nothing Then blockers.Add("Cannot read properties: " & m.Name)
+                If BRApi.Finance.Members.ReadMemberDescriptionsNoCache(si, DimType.Entity.Id, m.MemberId) Is Nothing Then blockers.Add("Cannot read descriptions: " & m.Name)
+            Next
+
+            For Each e As Edge In edges
+                Dim rel As Relationship = BRApi.Finance.Members.ReadRelationshipNoCache(si, DimType.Entity.Id, e.ChildId, e.ParentId)
+
+                If rel Is Nothing OrElse rel.IsUnknown Then blockers.Add("Cannot read relationship: " & e.ParentName & " -> " & e.ChildName)
+                If BRApi.Finance.Members.ReadRelationshipPropertiesNoCache(si, DimType.Entity.Id, e.ChildId, e.ParentId) Is Nothing Then blockers.Add("Cannot read relationship properties: " & e.ParentName & " -> " & e.ChildName)
+            Next
+
+            Dim plan As New StringBuilder()
+            plan.AppendLine("Dimension=" & DimensionName & "; Root=" & SourceRoot & "; HomeOffice=EXCLUDED FROM NEW")
+
+            For Each m As WritableMember In parents.Values.OrderBy(Function(x) x.Name, StringComparer.OrdinalIgnoreCase)
+                plan.AppendLine("RENAME ID " & m.MemberId & ": " & m.Name & " -> " & m.Name & ArchiveSuffix & "; CREATE new ID as " & m.Name)
+            Next
+
+            For Each e As Edge In edges.OrderBy(Function(x) x.ParentName).ThenBy(Function(x) x.ChildName)
+                Dim action As String = If(e.ChildName.Equals("HomeOffice", StringComparison.OrdinalIgnoreCase), "OMIT FROM NEW ONLY", If(parents.ContainsKey(e.ChildId), "NEW PARENT ID", "REUSE EXISTING ID"))
+                plan.AppendLine("LINK " & e.ParentName & " [" & e.ParentId & "] -> " & e.ChildName & " [" & e.ChildId & "]: " & action)
+            Next
+
+            Log(si, "Mode=" & If(RunMode, "EXECUTE", "PREVIEW") & "; Parents=" & parents.Count & "; Shared/excluded members=" & (nodes.Count - parents.Count) & "; Source relationships=" & edges.Count)
+            Log(si, plan.ToString())
+            Log(si, "Original IDs, data and relationships stay with _2026. Base entities stay shared. No data/adjustments are copied. Stored member/relationship variations are copied, not effective defaults. No reorganization mapping is applied.")
+            Log(si, "HomeOffice will not be cloned, renamed or linked to the new hierarchy. Existing parent data stays on the archived IDs. Shared base data is not a frozen historical snapshot.")
+
+            For Each problem As String In blockers
+                Log(si, "BLOCKER: " & problem)
+            Next
+
+            If Not RunMode Then
+                Log(si, "PREVIEW COMPLETE. Metadata unchanged. Blockers=" & blockers.Count)
+                Return Nothing
+            End If
+
+            If blockers.Count > 0 Then Throw New Exception("Preflight blocked execution. Review Error Log.")
+
+            'Writes are sequential, not a database transaction. Never blindly rerun a failed attempt.
+            'This lock protects this rule in one process only; it does not lock metadata globally.
+            Dim newIds As New Dictionary(Of Integer, Integer)()
+            Dim writeStarted As Boolean = False
+
+            Try
+                For Each m As WritableMember In parents.Values.OrderBy(Function(x) x.MemberId)
+
+                    Dim copy As New WritableMember(m)
+                    copy.MemberId = SharedConstants.Unknown
+                    copy.Name = StagePrefix & m.MemberId.ToString(CultureInfo.InvariantCulture)
+
+                    Dim props As VaryingMemberProperties = BRApi.Finance.Members.ReadMemberPropertiesNoCache(si, DimType.Entity.Id, m.MemberId)
+                    props.ClearMemberId()
+
+                    Dim descriptions As List(Of MemberDescription) = BRApi.Finance.Members.ReadMemberDescriptionsNoCache(si, DimType.Entity.Id, m.MemberId)
+
+                    For Each description As MemberDescription In descriptions
+                        description.ClearMemberId()
+                    Next
+
+                    Log(si, "ABOUT TO CREATE " & copy.Name & " from ID " & m.MemberId)
+                    writeStarted = True
+
+                    Dim pk As MemberPk = BRApi.Finance.MemberAdmin.SaveMemberInfo(si, True, copy, True, props, True, descriptions, TriStateBool.TrueValue)
+
+                    If pk.MemberId <= 0 OrElse pk.MemberId = m.MemberId Then Throw New Exception("Unexpected new member ID for " & m.Name)
+
+                    newIds.Add(m.MemberId, pk.MemberId)
+                    Log(si, "CREATED ID " & pk.MemberId & ": " & copy.Name)
+                Next
+
+                For Each e As Edge In edges
+                    If e.ChildName.Equals("HomeOffice", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+                    Dim newParentId As Integer = If(newIds.ContainsKey(e.ParentId), newIds(e.ParentId), e.ParentId)
+                    Dim newChildId As Integer = If(newIds.ContainsKey(e.ChildId), newIds(e.ChildId), e.ChildId)
+
+                    Dim rel As Relationship = BRApi.Finance.Members.ReadRelationshipNoCache(si, DimType.Entity.Id, e.ChildId, e.ParentId)
+                    Dim props As VaryingMemberProperties = BRApi.Finance.Members.ReadRelationshipPropertiesNoCache(si, DimType.Entity.Id, e.ChildId, e.ParentId)
+
+                    rel.ChangeChildId(newChildId)
+                    rel.ChangeParentId(newParentId)
+                    props.ChangeMemberId(newChildId)
+                    props.ChangeParentId(newParentId)
+
+                    Dim position As New RelationshipPositionOptions()
+                    position.SiblingId = SharedConstants.Unknown
+                    position.MovementType = RelationshipMovementType.RetainCurrentPosition
+
+                    Log(si, "ABOUT TO LINK parent ID " & newParentId & " -> child ID " & newChildId)
+                    BRApi.Finance.MemberAdmin.SaveRelationshipInfo(si, True, rel, True, props, position)
+                Next
+
+                'Finish the staged structure before changing any original name.
+                For Each m As WritableMember In parents.Values.OrderBy(Function(x) x.MemberId)
+                    Log(si, "ABOUT TO ARCHIVE ID " & m.MemberId & ": " & m.Name)
+                    BRApi.Finance.MemberAdmin.RenameMember(si, dp, m.Name, m.Name & ArchiveSuffix)
+                Next
+
+                For Each m As WritableMember In parents.Values.OrderBy(Function(x) x.MemberId)
+                    BRApi.Finance.MemberAdmin.RenameMember(si, dp, StagePrefix & m.MemberId.ToString(CultureInfo.InvariantCulture), m.Name)
+                    Log(si, "ACTIVE " & m.Name & "=" & newIds(m.MemberId) & "; ARCHIVE " & m.Name & ArchiveSuffix & "=" & m.MemberId)
+                Next
+
+                For Each m As WritableMember In parents.Values
+                    If BRApi.Finance.Members.ReadMemberNoCache(si, DimType.Entity.Id, m.MemberId).Name <> m.Name & ArchiveSuffix Then Throw New Exception("Archive verification failed: " & m.Name)
+                    If BRApi.Finance.Members.ReadMemberNoCache(si, DimType.Entity.Id, newIds(m.MemberId)).Name <> m.Name Then Throw New Exception("Active name verification failed: " & m.Name)
+                Next
+
+                Log(si, "ROLLOVER FINISHED. Validate properties, relationships, default parents and totals before changing hierarchy or consolidating. No consolidation was run.")
+
+            Catch ex As Exception
+                If writeStarted Then Log(si, "PARTIAL WRITE POSSIBLE. STOP; do not rerun. Keep the log and reconcile staged/archived IDs against the backup. No automatic delete or rollback has been attempted.")
+                Throw
+            End Try
+
+            Return Nothing
+        End Function
+
+        Private Sub Walk(si As SessionInfo, dp As DimPk, id As Integer, nodes As Dictionary(Of Integer, Member), parents As Dictionary(Of Integer, WritableMember), edges As List(Of Edge), visiting As HashSet(Of Integer), visited As HashSet(Of Integer))
+
+            If visiting.Contains(id) Then Throw New Exception("Cycle detected at entity ID " & id)
+            If visited.Contains(id) Then Return
+
+            Dim m As Member = BRApi.Finance.Members.GetMember(si, DimType.Entity.Id, id)
+            nodes(id) = m
+
+            If m.Name.Equals("HomeOffice", StringComparison.OrdinalIgnoreCase) Then
+                visited.Add(id)
+                Return
+            End If
+
+            visiting.Add(id)
+
+            Dim children As List(Of Member) = BRApi.Finance.Members.GetChildren(si, dp, id, Nothing)
+
+            If children.Count > 0 Then
+                parents(id) = BRApi.Finance.Members.ReadWritableMemberNoCache(si, DimType.Entity.Id, id)
+
+                For Each child As Member In children
+                    edges.Add(New Edge With {.ParentId = id, .ChildId = child.MemberId, .ParentName = m.Name, .ChildName = child.Name})
+                    Walk(si, dp, child.MemberId, nodes, parents, edges, visiting, visited)
+                Next
+            End If
+
+            visiting.Remove(id)
+            visited.Add(id)
+        End Sub
+
+        Private Sub Log(si As SessionInfo, message As String)
+            Const chunkSize As Integer = 12000
+
+            For start As Integer = 0 To message.Length - 1 Step chunkSize
+                BRApi.ErrorLog.LogMessage(si, "EDJ_MM_EntityRollover_2026 | " & message.Substring(start, Math.Min(chunkSize, message.Length - start)))
+            Next
+        End Sub
+
+    End Class
+End Namespace
