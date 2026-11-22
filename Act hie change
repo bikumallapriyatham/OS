@@ -13,3 +13,21 @@ Branch_Promotions_Allocation	Branch Support Allocations_MM	Branch Promotions_MM
 Branch_Advertising_Allocation	Branch Support Allocations_MM	Branch Advertising_MM
 Recognition_Conferences_Allocation	Branch Support Allocations_MM	Non SRM Branch Travel and Entertainment_MM
 SRM_Allocation	Branch Support Allocations_MM	Branch Travel and Entertainment_MM
+
+
+Accounts for grid view check parents:
+A#Revenue_Sharing_Allocation,
+A#Cash_Solution_Allocation,
+A#Advisory_Program_Admin_Allocation,
+A#Record_Keeping_Fee_Allocation,
+A#Margin_Interest_Allocation,
+A#Bank_Interest_Allocation,
+A#Interest_On_Treasuries_Seg_Allocation,
+A#930210,
+A#TAP_Allocation,
+A#Firm_Support_Allocation,
+A#930220,
+A#Branch_Promotions_Allocation,
+A#Branch_Advertising_Allocation,
+A#Recognition_Conferences_Allocation,
+A#SRM_Allocation
