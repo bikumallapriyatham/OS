@@ -1,0 +1,15 @@
+Revenue_Sharing_Allocation	Revenue Allocations_MM	Asset Based Revenue Sharing_MM
+Cash_Solution_Allocation	Revenue Allocations_MM	Cash Solutions_MM
+Advisory_Program_Admin_Allocation	Revenue Allocations_MM	Advisory Program Administrative Fees_MM
+Record_Keeping_Fee_Allocation	Revenue Allocations_MM	Record Keeping Fees_MM
+Margin_Interest_Allocation	Revenue Allocations_MM	Customer Loans_MM
+Bank_Interest_Allocation	Revenue Allocations_MM	Other Interest Income_MM
+Interest_On_Treasuries_Seg_Allocation	Revenue Allocations_MM	Other Interest Income_MM
+930210	Statistics_MM	FA Salary and Other Compensation_MM
+TAP_Allocation	FA Comp Allocations_MM	Incentive Awards_MM
+Firm_Support_Allocation	Expense Allocations_MM	HO Operating Expense_MM
+930220	Statistics_MM	Other Branch Compensation_MM
+Branch_Promotions_Allocation	Branch Support Allocations_MM	Branch Promotions_MM
+Branch_Advertising_Allocation	Branch Support Allocations_MM	Branch Advertising_MM
+Recognition_Conferences_Allocation	Branch Support Allocations_MM	Non SRM Branch Travel and Entertainment_MM
+SRM_Allocation	Branch Support Allocations_MM	Branch Travel and Entertainment_MM
